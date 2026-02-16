@@ -1,0 +1,5 @@
+Baseline latency = 820,162 * 6.999ns = 5.74ms
+
+Simple Pipeline latency = 77,378 * 7.231ns = 0.5595ms | Speedup: 10.259x
+
+Added Unrolling = 40,514 * 6.044ns = 0.2449ms | Speedup: 23.441x
