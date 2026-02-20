@@ -94,12 +94,38 @@ void top_kernel(const data_t A_in[NX][NY], data_t A_out[NX][NY]) {
     #pragma HLS BIND_STORAGE variable=buf0 type=ram_2p impl=bram
     #pragma HLS BIND_STORAGE variable=buf1 type=ram_2p impl=bram
 
-    // 1. Load Data (Burst Read Wide)
-    Load_Loop_R: for(int i=0; i<NX; i++) {
-        Load_Loop_C: for(int j=0; j<NY; j++) {
-            #pragma HLS PIPELINE II=1
-            #pragma HLS UNROLL factor=UF
-            buf0[i][j] = A_in[i][j];
+    // Cast the 2D arrays to 1D 512-bit wide pointers
+    // Note: This assumes NX*NY is cleanly divisible by 16, and data_t is 32 bits.
+    const ap_uint<512>* A_in_wide = (const ap_uint<512>*)A_in;
+    ap_uint<512>* A_out_wide = (ap_uint<512>*)A_out;
+
+    int total_chunks = (NX * NY) / 16;
+
+    // ---------------------------------------------------------
+    // 1. Explicitly Vectorized Load Loop
+    // ---------------------------------------------------------
+    Load_Loop: for(int chunk = 0; chunk < total_chunks; chunk++) {
+        #pragma HLS PIPELINE II=1
+        
+        // Read 512 bits (16 elements) in ONE clock cycle
+        ap_uint<512> wide_access = A_in_wide[chunk];
+
+        // Unpack the 16 elements
+        Unpack_Loop: for(int k = 0; k < 16; k++) {
+            #pragma HLS UNROLL
+            
+            // Slice out 32 bits at a time
+            unsigned int raw_bits = wide_access.range(32 * (k + 1) - 1, 32 * k);
+            
+            // Bit-cast the raw integer bits back to your data_t (e.g., float)
+            data_t val = *(data_t*)(&raw_bits); 
+
+            // Calculate 2D indices from the 1D chunk index
+            int flat_idx = chunk * 16 + k;
+            int i = flat_idx / NY;
+            int j = flat_idx % NY;
+            
+            buf0[i][j] = val;
         }
     }
 
@@ -112,14 +138,34 @@ void top_kernel(const data_t A_in[NX][NY], data_t A_out[NX][NY]) {
         }
     }
 
-    // 3. Write Data (Burst Write Wide)
+    // ---------------------------------------------------------
+    // 3. Explicitly Vectorized Store Loop
+    // ---------------------------------------------------------
     data_t (*final_src)[NY] = (TSTEPS % 2 == 0) ? buf0 : buf1;
 
-    Store_Loop_R: for(int i=0; i<NX; i++) {
-        Store_Loop_C: for(int j=0; j<NY; j++) {
-            #pragma HLS PIPELINE II=1
-            #pragma HLS UNROLL factor=UF
-            A_out[i][j] = final_src[i][j];
+    Store_Loop: for(int chunk = 0; chunk < total_chunks; chunk++) {
+        #pragma HLS PIPELINE II=1
+        
+        ap_uint<512> wide_write = 0;
+
+        // Pack the 16 elements
+        Pack_Loop: for(int k = 0; k < 16; k++) {
+            #pragma HLS UNROLL
+            
+            int flat_idx = chunk * 16 + k;
+            int i = flat_idx / NY;
+            int j = flat_idx % NY;
+            
+            data_t val = final_src[i][j];
+            
+            // Bit-cast the data_t to raw integer bits
+            unsigned int raw_bits = *(unsigned int*)(&val);
+            
+            // Insert the 32 bits into the 512-bit word
+            wide_write.range(32 * (k + 1) - 1, 32 * k) = raw_bits;
         }
+
+        // Write 512 bits in ONE clock cycle
+        A_out_wide[chunk] = wide_write;
     }
 }
