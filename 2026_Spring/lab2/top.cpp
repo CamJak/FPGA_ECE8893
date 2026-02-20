@@ -1,7 +1,7 @@
 #include "dcl.h"
 
 // Set Unroll Factor (Experiment with 2, 4, 8, or 16 depending on available LUTs/DSPs)
-#define UF 16
+#define UF 32
 
 // -------------------------------------------------------------------------
 // Internal Compute Kernel
