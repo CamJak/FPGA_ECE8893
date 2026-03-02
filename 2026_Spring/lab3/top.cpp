@@ -1,107 +1,164 @@
 #include "dcl.h"
+#include <hls_stream.h>
+#include <ap_int.h>
 
-// Baseline: 5-stage DAG written as array passes (correct but slow).
-// Conceptual kernels (should refactor into dataflow with hls::stream):
-//   K0: preprocess
-//   K1: transform (sliding window)
-//   K2: per-block statistic (1 token per block, delayed until block complete)  [extra-hard twist]
-//   K3: join + normalize using inv_stat (1 division per block, then multiply per element)
-//   K4: postprocess + store
+#define VEC_SIZE 16
+typedef ap_uint<512> bus_t;
 
-static inline data_t abs_fp(data_t x) {
-    return (x < (data_t)0) ? (data_t)(-x) : x;
+struct vec_t {
+    data_t d[VEC_SIZE];
+};
+
+// -------------------------------------------------------------------------
+// STAGE 0: Load and Preprocess (K0)
+// -------------------------------------------------------------------------
+void load_and_k0(const bus_t* in_bus, hls::stream<vec_t>& out_stream) {
+    const coef_t alpha = (coef_t)0.875, beta = (coef_t)0.125;
+    for (int i = 0; i < N / VEC_SIZE; i++) {
+        #pragma HLS PIPELINE II=1
+        bus_t raw = in_bus[i];
+        vec_t v;
+        for (int k = 0; k < VEC_SIZE; k++) {
+            #pragma HLS UNROLL
+            ap_uint<32> bits = raw.range(k * 32 + 31, k * 32);
+            data_t val = reinterpret_cast<data_t&>(bits);
+            v.d[k] = (data_t)((acc_t)alpha * (acc_t)val + (acc_t)beta);
+        }
+        out_stream.write(v);
+    }
 }
 
-static inline data_t clamp_fp(data_t x, data_t lo, data_t hi) {
-    if (x < lo) return lo;
-    if (x > hi) return hi;
-    return x;
+// -------------------------------------------------------------------------
+// STAGE 1: Non-Blocking Splitter
+// -------------------------------------------------------------------------
+void split_stream(hls::stream<vec_t>& in, hls::stream<vec_t>& out_a, hls::stream<vec_t>& out_b) {
+    for (int i = 0; i < N / VEC_SIZE; i++) {
+        #pragma HLS PIPELINE II=1
+        vec_t val = in.read();
+        out_a.write(val);
+        out_b.write(val);
+    }
 }
 
-void top_kernel(const data_t in[N], data_t out[N]) {
+// -------------------------------------------------------------------------
+// STAGE 2: K1 Transform (Fast Path)
+// -------------------------------------------------------------------------
+void transform_k1(hls::stream<vec_t>& in_stream, hls::stream<vec_t>& out_stream) {
+    const coef_t w0 = (coef_t)0.50, w1 = (coef_t)(-0.25), w2 = (coef_t)0.125;
+    data_t prev1 = 0, prev2 = 0;
 
-#pragma HLS interface m_axi port=in offset=slave bundle=in
-#pragma HLS interface m_axi port=out offset=slave bundle=out
-#pragma HLS interface s_axilite port=return
+    for (int i = 0; i < N / VEC_SIZE; i++) {
+        #pragma HLS PIPELINE II=1
+        vec_t in_v = in_stream.read();
+        vec_t out_v;
+        for (int k = 0; k < VEC_SIZE; k++) {
+            #pragma HLS UNROLL
+            data_t x0 = in_v.d[k];
+            data_t x1 = (k >= 1) ? in_v.d[k - 1] : prev1;
+            data_t x2 = (k >= 2) ? in_v.d[k - 2] : ((k == 1) ? prev1 : prev2);
 
+            // Break up the FIR math into pipelined stages
+            acc_t p0 = (acc_t)w0 * (acc_t)x0;
+            acc_t p1 = (acc_t)w1 * (acc_t)x1;
+            acc_t p2 = (acc_t)w2 * (acc_t)x2;
+            #pragma HLS bind_op variable=p0 op=mul impl=dsp latency=3
+            #pragma HLS bind_op variable=p1 op=mul impl=dsp latency=3
+            #pragma HLS bind_op variable=p2 op=mul impl=dsp latency=3
 
-    static data_t s0[N];               // after preprocess
-    static data_t s1[N];               // after transform
-    static stat_t stats[N / BLOCK];    // 1 stat per block
-    static data_t s3[N];               // after normalize
-
-    // Coefficients (constants)
-    const coef_t alpha = (coef_t)0.875;
-    const coef_t beta  = (coef_t)0.125;
-
-    const coef_t w0 = (coef_t)0.50;
-    const coef_t w1 = (coef_t)(-0.25);
-    const coef_t w2 = (coef_t)0.125;
-
-    const stat_t eps = (stat_t)0.5;    // avoid tiny stats
-    const coef_t gamma = (coef_t)1.25;
-    const coef_t delta = (coef_t)0.05;
-
-    // -------------------------
-    // K0: preprocess
-    // -------------------------
-    for (int k = 0; k < N; k++) {
-        s0[k] = (data_t)((acc_t)alpha * (acc_t)in[k] + (acc_t)beta);
+            acc_t acc = p0 + p1 + p2;
+            data_t raw_y = (data_t)acc;
+            data_t abs_y = (raw_y < 0) ? (data_t)(-raw_y) : raw_y;
+            
+            // Final clamp
+            out_v.d[k] = (abs_y > (data_t)7.5) ? (data_t)7.5 : abs_y;
+        }
+        prev2 = in_v.d[VEC_SIZE - 2];
+        prev1 = in_v.d[VEC_SIZE - 1];
+        out_stream.write(out_v);
     }
+}
 
-    // -------------------------
-    // K1: transform (3-tap + abs + clamp)
-    // -------------------------
-    for (int k = 0; k < N; k++) {
-        data_t x0 = s0[k];
-        data_t x1 = (k >= 1) ? s0[k - 1] : (data_t)0;
-        data_t x2 = (k >= 2) ? s0[k - 2] : (data_t)0;
-
-        acc_t acc = (acc_t)w0 * (acc_t)x0 + (acc_t)w1 * (acc_t)x1 + (acc_t)w2 * (acc_t)x2;
-        data_t y = (data_t)acc;
-        y = abs_fp(y);
-        y = clamp_fp(y, (data_t)0, (data_t)7.5);
-        s1[k] = y;
-    }
-
-    // -------------------------
-    // K2: per-block statistic (delayed)
-    // stats[b] = avg_abs(s0[block]) + eps
-    // -------------------------
+// -------------------------------------------------------------------------
+// STAGE 3: K2 Block Statistics (Slow Path)
+// -------------------------------------------------------------------------
+void compute_stat_k2(hls::stream<vec_t>& in_stream, hls::stream<stat_t>& inv_stat_out) {
+    const stat_t eps = (stat_t)0.5;
     for (int b = 0; b < (N / BLOCK); b++) {
         acc_t sum_abs = 0;
-        int base = b * BLOCK;
-        for (int i = 0; i < BLOCK; i++) {
-            sum_abs += (acc_t)abs_fp(s0[base + i]);
+        for (int i = 0; i < (BLOCK / VEC_SIZE); i++) {
+            #pragma HLS PIPELINE II=1
+            vec_t v = in_stream.read();
+            acc_t local_v_sum = 0;
+            for (int k = 0; k < VEC_SIZE; k++) {
+                #pragma HLS UNROLL
+                data_t val = v.d[k];
+                local_v_sum += (val < 0) ? (acc_t)(-val) : (acc_t)val;
+            }
+            sum_abs += local_v_sum;
         }
         stat_t avg_abs = (stat_t)(sum_abs / (acc_t)BLOCK);
-        stats[b] = avg_abs + eps;
+        stat_t divisor = avg_abs + eps;
+        
+        stat_t inv_st;
+        // Pipelining the division is the #1 way to hit 100MHz (10ns)
+        #pragma HLS bind_op variable=inv_st op=fdiv impl=fabric latency=14
+        inv_st = (stat_t)((acc_t)1.0 / (acc_t)divisor);
+        
+        inv_stat_out.write(inv_st);
     }
+}
 
-    // -------------------------
-    // K3: join + normalize (1 division per block, multiply per element)
-    // s3[k] = s1[k] * inv_stat(block(k))
-    // -------------------------
+// -------------------------------------------------------------------------
+// STAGE 4: K3/K4 Join, Normalize, and Store
+// -------------------------------------------------------------------------
+void join_and_store(hls::stream<vec_t>& s1_in, hls::stream<stat_t>& inv_stat_in, bus_t* out_bus) {
+    const coef_t gamma = (coef_t)1.25, delta = (coef_t)0.05;
     for (int b = 0; b < (N / BLOCK); b++) {
-        stat_t st = stats[b];
-
-        // One division per block:
-        // inv_stat = 1 / st
-        stat_t inv_st = (stat_t)((acc_t)1 / (acc_t)st);
-
-        int base = b * BLOCK;
-        for (int i = 0; i < BLOCK; i++) {
-            s3[base + i] = (data_t)((acc_t)s1[base + i] * (acc_t)inv_st);
+        stat_t inv_st = inv_stat_in.read();
+        for (int i = 0; i < (BLOCK / VEC_SIZE); i++) {
+            #pragma HLS PIPELINE II=1
+            vec_t in_v = s1_in.read();
+            bus_t out_raw;
+            for (int k = 0; k < VEC_SIZE; k++) {
+                #pragma HLS UNROLL
+                acc_t s3 = (acc_t)in_v.d[k] * (acc_t)inv_st;
+                #pragma HLS bind_op variable=s3 op=mul impl=dsp latency=2
+                data_t z = (data_t)((acc_t)gamma * s3 + (acc_t)delta);
+                if (z < 0) z = 0; if (z > (data_t)7.9) z = (data_t)7.9;
+                
+                ap_uint<32> bits = reinterpret_cast<ap_uint<32>&>(z);
+                out_raw.range(k * 32 + 31, k * 32) = bits;
+            }
+            out_bus[b * (BLOCK / VEC_SIZE) + i] = out_raw;
         }
     }
+}
 
-    // -------------------------
-    // K4: postprocess + store
-    // out[k] = clamp(s3[k] * gamma + delta, 0, 7.9)
-    // -------------------------
-    for (int k = 0; k < N; k++) {
-        data_t z = (data_t)((acc_t)gamma * (acc_t)s3[k] + (acc_t)delta);
-        z = clamp_fp(z, (data_t)0, (data_t)7.9);
-        out[k] = z;
-    }
+// -------------------------------------------------------------------------
+// TOP KERNEL
+// -------------------------------------------------------------------------
+void top_kernel(const data_t in[N], data_t out[N]) {
+    #pragma HLS interface m_axi port=in  offset=slave bundle=gmem0 max_widen_bitwidth=512
+    #pragma HLS interface m_axi port=out offset=slave bundle=gmem1 max_widen_bitwidth=512
+    #pragma HLS interface s_axilite port=return
+
+    hls::stream<vec_t> s_k0, s0_a, s0_b, s1;
+    hls::stream<stat_t> inv_stats;
+
+    // MANDATORY: s1 must be large enough to hold an entire block + overhead.
+    // If BLOCK=1024 and VEC=16, depth must be > 64. We use 256 for safety.
+    #pragma HLS STREAM variable=s1 depth=256
+    #pragma HLS BIND_STORAGE variable=s1 type=ram_2p impl=bram
+
+    #pragma HLS STREAM variable=s_k0 depth=16
+    #pragma HLS STREAM variable=s0_a depth=16
+    #pragma HLS STREAM variable=s0_b depth=16
+    #pragma HLS STREAM variable=inv_stats depth=4
+
+    #pragma HLS DATAFLOW
+    load_and_k0((const bus_t*)in, s_k0);
+    split_stream(s_k0, s0_a, s0_b);
+    transform_k1(s0_a, s1);
+    compute_stat_k2(s0_b, inv_stats);
+    join_and_store(s1, inv_stats, (bus_t*)out);
 }
