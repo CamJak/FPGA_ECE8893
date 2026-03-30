@@ -15,6 +15,11 @@ void top_kernel(const data_t in[N], data_t out[N]) {
     static stat_t block_peak[N / BLOCK];
     static data_t stage3[N];
 
+    #pragma HLS array_partition variable=stage1 cyclic factor=4 dim=1
+    #pragma HLS array_partition variable=stage2 cyclic factor=4 dim=1
+    #pragma HLS array_partition variable=block_peak cyclic factor=4 dim=1
+    #pragma HLS array_partition variable=stage3 cyclic factor=4 dim=1
+
     // ---------------------------------------------------------------------
     // STAGE 1: Pre-scale and Bias
     // ---------------------------------------------------------------------
@@ -26,6 +31,7 @@ void top_kernel(const data_t in[N], data_t out[N]) {
     // STAGE 2: 4-Tap Asymmetric Filter (Sliding Window)
     // ---------------------------------------------------------------------
     for (int i = 0; i < N; i++) {
+        #pragma HLS unroll factor=4
         data_t x0 = stage1[i];
         data_t x1 = (i >= 1) ? stage1[i - 1] : (data_t)0;
         data_t x2 = (i >= 2) ? stage1[i - 2] : (data_t)0;
