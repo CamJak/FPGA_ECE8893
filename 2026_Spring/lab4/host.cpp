@@ -177,9 +177,11 @@ int main() {
     int error_count = 0;
     double max_diff = 0;
     
-    // Because the C code now perfectly mirrors the HLS types,
-    // Epsilon can be incredibly small.
-    const double EPSILON = 0.01; 
+    // Define 1% Relative Tolerance
+    const double TOLERANCE = 0.01; 
+    
+    // Small constant to prevent division by zero and handle values near the noise floor
+    const double MIN_THRESHOLD = 1e-5; 
 
     for (int i = 0; i < N; i++) {
         double hw_val = (double)hw_output[i];
@@ -188,9 +190,21 @@ int main() {
         
         if (diff > max_diff) max_diff = diff;
         
-        if (diff > EPSILON) {
+        double error_metric = 0;
+        
+        if (std::abs(sw_val) > MIN_THRESHOLD) {
+            // Use Relative Error for significant values
+            error_metric = diff / std::abs(sw_val);
+        } else {
+            // Use Absolute Error for values near zero (to avoid division by zero)
+            error_metric = diff;
+        }
+
+        if (error_metric > TOLERANCE) {
             if (error_count < 10) {
-                std::cout << "Mismatch at [" << i << "]: Exp " << sw_val << " Got " << hw_val << std::endl;
+                std::cout << "Tolerance Violation at [" << i << "]: " 
+                          << "Expected " << sw_val << ", Got " << hw_val 
+                          << " (Error: " << (error_metric * 100.0) << "%)" << std::endl;
             }
             error_count++;
         }
